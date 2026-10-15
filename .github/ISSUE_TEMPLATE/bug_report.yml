@@ -1,0 +1,28 @@
+name: Bug report
+description: Reproducible application or Bluetooth playback issue
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: Do not paste unredacted device IDs, private logs, credentials or dumps. Connection state is not proof of sound.
+  - type: input
+    id: version
+    attributes:
+      label: AudioBridge version and Windows version
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps, expected behavior and actual behavior
+      description: Include whether sound was actually audible, and whether it returned without a reconnect.
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Source and adapter model (no personal identifiers)
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: Reviewed and redacted diagnostic excerpt (optional)

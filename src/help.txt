@@ -1,0 +1,8 @@
+AudioBridge — Windows A2DP Sink
+--help : aide sans acces Bluetooth
+--list : enumerer les sources audio compatibles, sans connexion
+--diagnose : diagnostic audio seul
+Sans argument : console interactive.
+Commandes : list | connect N | repair | disconnect | status | diagnose | auto on | auto off | quit
+repair ferme puis recree la session ; connecte ne garantit pas un son audible.
+Aucun service, aucun demarrage automatique. Un seul telephone actif.

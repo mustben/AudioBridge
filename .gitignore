@@ -1,0 +1,13 @@
+/target/
+/dist/
+*.exe
+*.zip
+*.log
+*.dmp
+.env
+.env.*
+!.env.example
+/verification-*.txt
+/.hermes/
+__pycache__/
+*.py[cod]

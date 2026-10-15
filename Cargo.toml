@@ -1,0 +1,14 @@
+[package]
+name = "audio-bridge"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Prototype local de reception audio Bluetooth Windows"
+license = "MIT"
+
+[dependencies]
+windows = { version = "=0.58.0", features = ["Devices_Enumeration", "Foundation", "Foundation_Collections", "Media_Audio", "Win32_System_WinRT", "Win32_System_Com", "Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_Devices_FunctionDiscovery", "Win32_UI_Shell_PropertiesSystem", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_SystemInformation"] }
+
+[[bin]]
+name = "audio-bridge-tray"
+path = "src/bin/audio_bridge_tray.rs"
