@@ -58,7 +58,7 @@ def main() -> None:
         + "\n".join(rows)
         + "\n\nFull texts: `THIRD_PARTY_LICENSES/`. The application and original icon are MIT licensed.\n"
     )
-    (root / "THIRD_PARTY_NOTICES.md").write_text(text, encoding="utf-8")
+    (root / "THIRD_PARTY_NOTICES.md").write_text(text, encoding="utf-8", newline="\n")
     print(f"Exported actual license texts for {len(rows)} dependency packages")
 
 

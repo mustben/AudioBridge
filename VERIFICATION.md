@@ -1,13 +1,13 @@
 # Verification — AudioBridge 0.3 community preview
 
-This report covers local Windows x64 execution. It is not a Bluetooth stability certification, an iPhone compatibility claim, or evidence that GitHub CI ran.
+This report covers local Windows x64 execution and the separately recorded GitHub CI investigation. It is not a Bluetooth stability certification or an iPhone compatibility claim.
 
 ## Local build and tests
 
 - Rust formatting was applied and checked.
 - `cargo +stable test --locked --all-targets` passed: 22 successful tests, 3 hardware-environment tests explicitly ignored.
 - `cargo +stable test --locked --all-targets -- --include-ignored --test-threads=1` passed: all 25 Rust tests, including the actual Windows enumeration/diagnostic environment checks.
-- `python scripts/test_export_licenses.py` passed all 3 policy regressions; offline license export succeeded for the actual locked dependencies.
+- `python scripts/test_export_licenses.py` passed all 4 policy/checkout regressions, including a real Git checkout with `core.autocrlf=true` and a negative control that still detects edited license content; offline license export succeeded for the actual locked dependencies.
 - `cargo +stable clippy --locked --all-targets -- -D warnings` passed.
 - Release builds of `audio-bridge-tray` and `audio-bridge` succeeded.
 
@@ -36,7 +36,7 @@ The tray routing tests cover stable opaque device IDs, busy-action exclusion, Qu
 - Audible playback through the new tray command path, Android call return, repeated link loss, sleep/resume, long-running stability and iPhone behavior require their own hardware tests. Earlier console playback was user-validated; it is not substituted for these tests.
 - The worker's diagnostic save path was executed by tests. Automatic Notepad opening from the native menu was not successfully exercised by the desktop automation and must be checked manually; no successful UI-open result is claimed.
 - Explorer/taskbar recreation support is implemented but was not tested by restarting the user's Explorer session.
-- No public repository, remote CI run, tag or release was created. The GitHub workflows are prepared definitions only.
+- Sources were published with the owner's approval to `https://github.com/mustben/AudioBridge`, branch `develop`. The first Windows CI run (38796430697) passed formatting, Rust tests and Clippy, then failed license consistency because Git's Windows checkout changed line endings. That failure was reproduced in a fresh clone. The correction preserves copied license bytes with `.gitattributes` and writes generated notices with explicit LF; the consistency guard remains enabled. Remote success must be verified on the corrected commit, not inferred from local tests. No tag or release has been created.
 
 ## Final independent review
 
@@ -46,4 +46,4 @@ The final targeted independent review accepted all four previously blocking corr
 
 The source publication set is enumerated with Git's ignore rules and scanned for known private paths/device identifiers and common token formats. No matches were found in the scanned text. This is a bounded check, not a formal security audit. Full desktop screenshots, local diagnostics, logs, executables and build outputs are not included in the source publication set.
 
-The application is an unsigned preview. No auto-start registration, service, certificate trust change, telemetry or updater is implemented. Public publication still requires the owner's approval.
+The application is an unsigned preview. No auto-start registration, service, certificate trust change, telemetry or updater is implemented. The initial source publication was owner-approved; tags and releases still require separate approval.

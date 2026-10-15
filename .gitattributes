@@ -1,0 +1,5 @@
+# Preserve the exact license bytes copied from Cargo package archives.
+THIRD_PARTY_LICENSES/** -text
+
+# Generated notices use deterministic LF on every operating system.
+THIRD_PARTY_NOTICES.md text eol=lf
