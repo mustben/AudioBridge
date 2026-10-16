@@ -10,12 +10,14 @@ fn route(id: u32, s: &BackendSnapshot, closing: bool) -> Option<BackendCommand> 
     if id == 9 {
         return Some(BackendCommand::Quit);
     }
+    if id == 2 && (s.connected || s.wanted || s.retry_pending || s.session_owned || s.busy) {
+        return Some(BackendCommand::Disconnect);
+    }
     if s.busy {
         return None;
     }
     match id {
         1 => Some(BackendCommand::Refresh),
-        2 if s.connected => Some(BackendCommand::Disconnect),
         3 if s.selected_id.is_some() => Some(BackendCommand::Repair),
         4 => Some(BackendCommand::SetAuto(!s.auto_recovery)),
         5 => Some(BackendCommand::Diagnose),
@@ -28,9 +30,7 @@ fn route(id: u32, s: &BackendSnapshot, closing: bool) -> Option<BackendCommand> 
 }
 
 fn accept_snapshot(current: &mut BackendSnapshot, failed: &mut bool, next: BackendSnapshot) {
-    if next.busy {
-        *failed = false;
-    }
+    *failed = next.error.is_some();
     *current = next;
 }
 
@@ -62,6 +62,39 @@ fn icon_frame(bytes: &[u8]) -> Result<&[u8], String> {
     }
     best.map(|(_, frame)| frame)
         .ok_or_else(|| "Aucune image ICO valide".into())
+}
+
+struct TooltipState {
+    last_applied: String,
+    retry_at: Option<std::time::Instant>,
+}
+impl TooltipState {
+    fn new(last_applied: String) -> Self {
+        Self {
+            last_applied,
+            retry_at: None,
+        }
+    }
+    // Returns true only for the first failure in an uninterrupted failure streak.
+    fn update(
+        &mut self,
+        desired: &str,
+        now: std::time::Instant,
+        apply: impl FnOnce(&str) -> bool,
+    ) -> bool {
+        if desired == self.last_applied || self.retry_at.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        if apply(desired) {
+            self.last_applied = desired.to_owned();
+            self.retry_at = None;
+            false
+        } else {
+            let first_failure = self.retry_at.is_none();
+            self.retry_at = Some(now + std::time::Duration::from_secs(1));
+            first_failure
+        }
+    }
 }
 
 const CLOSE: u8 = 1;
@@ -97,8 +130,6 @@ mod native {
     use super::*;
     use audio_bridge::{app, protocol::BackendEvent};
     use std::{
-        fs::OpenOptions,
-        io::Write,
         path::PathBuf,
         sync::mpsc::TryRecvError,
         time::{Duration, Instant},
@@ -143,13 +174,15 @@ mod native {
     }
     fn log(s: &str) {
         let dir = logs();
-        if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("tray.log"))
-                .and_then(|mut f| writeln!(f, "{s}"))
-        }) {
+        // A failed disk must not create repeated diagnostics on each UI update.
+        static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir)
+            .and_then(|()| audio_bridge::logging::append(&dir.join("tray.log"), s, true))
+        {
+            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
             eprintln!("Journal tray: {e}");
         }
     }
@@ -449,6 +482,7 @@ mod native {
             message: "Inventaire en cours…".into(),
             ..Default::default()
         };
+        let mut tooltip = TooltipState::new("Audio Bridge — Libre".to_owned());
         let mut closing = false;
         let mut failed = false;
         let started = Instant::now();
@@ -501,14 +535,16 @@ mod native {
                             if !s.busy {
                                 saw_inventory = true;
                             }
-                            log(&format!(
-                                "Snapshot devices={} connected={} busy={} auto={} message={}",
-                                s.devices.len(),
-                                s.connected,
-                                s.busy,
-                                s.auto_recovery,
-                                s.message
-                            ));
+                            if s != snapshot {
+                                log(&format!(
+                                    "Snapshot devices={} connected={} busy={} auto={} message={}",
+                                    s.devices.len(),
+                                    s.connected,
+                                    s.busy,
+                                    s.auto_recovery,
+                                    s.message
+                                ));
+                            }
                             accept_snapshot(&mut snapshot, &mut failed, s);
                         }
                         Ok(BackendEvent::Error(e)) => {
@@ -549,12 +585,21 @@ mod native {
                     ));
                     chosen = 9;
                 }
-                let text = wide(&tip(&snapshot, closing, failed));
-                tray.0.szTip.fill(0);
-                let count = text.len().min(tray.0.szTip.len() - 1);
-                tray.0.szTip[..count].copy_from_slice(&text[..count]);
-                if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &tray.0) }.as_bool() {
-                    log("NIM_MODIFY failed");
+                let next_tip = tip(&snapshot, closing, failed);
+                if tooltip.update(&next_tip, Instant::now(), |desired| {
+                    // Keep the restore payload consistent with the last successful update.
+                    let mut candidate = tray.0;
+                    let text = wide(desired);
+                    candidate.szTip.fill(0);
+                    let count = text.len().min(candidate.szTip.len() - 1);
+                    candidate.szTip[..count].copy_from_slice(&text[..count]);
+                    let applied = unsafe { Shell_NotifyIconW(NIM_MODIFY, &candidate) }.as_bool();
+                    if applied {
+                        tray.0 = candidate;
+                    }
+                    applied
+                }) {
+                    log("NIM_MODIFY failed; retrying at most once per second");
                 }
             }
             if let Some(cmd) = route(chosen, &snapshot, closing) {
@@ -602,6 +647,47 @@ mod native {
 mod tests {
     use super::*;
     #[test]
+    fn tooltip_retry_retains_success_and_bounds_attempts_and_error_logs() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut policy = TooltipState::new("old".into());
+        let mut calls = 0;
+        {
+            let mut apply = |_: &str| {
+                calls += 1;
+                false
+            };
+            assert!(policy.update("new", start, &mut apply));
+            assert_eq!(
+                policy.last_applied, "old",
+                "failed update must not be acknowledged"
+            );
+            assert!(!policy.update("new", start + Duration::from_millis(999), &mut apply));
+            assert!(!policy.update("new", start + Duration::from_secs(1), &mut apply));
+            assert!(!policy.update("different", start + Duration::from_millis(1500), &mut apply));
+        }
+        assert_eq!(
+            calls, 2,
+            "failures retry at most once per second, even if desired changes"
+        );
+        assert_eq!(policy.last_applied, "old");
+        assert!(!policy.update("new", start + Duration::from_secs(2), |_| {
+            calls += 1;
+            true
+        }));
+        assert_eq!(policy.last_applied, "new");
+        assert!(
+            !policy.update("new", start + Duration::from_secs(3), |_| panic!(
+                "redundant Shell call"
+            ))
+        );
+        assert_eq!(calls, 3);
+        assert!(
+            policy.update("next", start + Duration::from_secs(3), |_| false),
+            "success resets error suppression"
+        );
+    }
+    #[test]
     fn routing_preserves_opaque_ids_and_blocks_busy_mutations() {
         let mut s = BackendSnapshot {
             devices: vec![audio_bridge::protocol::DeviceInfo {
@@ -618,30 +704,54 @@ mod tests {
         s.auto_recovery = true;
         assert_eq!(route(4, &s, false), Some(BackendCommand::SetAuto(false)));
         s.busy = true;
-        for id in [1, 2, 3, 4, 5, 100] {
+        for id in [1, 3, 4, 5, 100] {
             assert_eq!(route(id, &s, false), None);
         }
         assert_eq!(route(9, &s, true), None);
         assert_eq!(route(101, &BackendSnapshot::default(), false), None);
     }
     #[test]
-    fn final_snapshot_preserves_error_until_next_operation() {
+    fn polling_and_unrelated_busy_operations_preserve_authoritative_error() {
         let mut current = BackendSnapshot::default();
-        let mut failed = true;
-        accept_snapshot(&mut current, &mut failed, BackendSnapshot::default());
-        assert!(
-            failed,
-            "final snapshot must not erase the immediately preceding worker error"
-        );
+        let mut failed = false;
+        for busy in [false, true, false, false] {
+            accept_snapshot(
+                &mut current,
+                &mut failed,
+                BackendSnapshot {
+                    busy,
+                    error: Some("connection error".into()),
+                    ..Default::default()
+                },
+            );
+            assert!(failed);
+        }
         accept_snapshot(
             &mut current,
             &mut failed,
             BackendSnapshot {
-                busy: true,
+                connected: true,
                 ..Default::default()
             },
         );
         assert!(!failed);
+    }
+    #[test]
+    fn disconnect_cancels_waiting_recovery_and_can_be_queued_while_busy() {
+        for s in [
+            BackendSnapshot {
+                wanted: true,
+                retry_pending: true,
+                ..Default::default()
+            },
+            BackendSnapshot {
+                busy: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(route(2, &s, false), Some(BackendCommand::Disconnect));
+        }
+        assert_eq!(route(2, &BackendSnapshot::default(), false), None);
     }
     #[test]
     fn embedded_multiframe_icon_selects_real_32px_frame() {

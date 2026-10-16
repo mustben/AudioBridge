@@ -1,16 +1,22 @@
 use crate::platform::{self, Device, Notice, Session};
-use crate::protocol::{BackendCommand, BackendEvent, BackendHandle, BackendSnapshot, DeviceInfo};
+use crate::protocol::{
+    BackendCommand, BackendEvent, BackendHandle, BackendSnapshot, DeviceInfo, EventSender,
+    event_channel,
+};
 use crate::{Policy, Recovery, SessionSlot};
 use std::{
     fs::{self, File},
-    io::{self, BufRead, Write},
+    io::{self, BufRead},
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 struct Log {
-    file: File,
+    file: PathBuf,
+    #[cfg(test)]
+    cleanup_root: Option<PathBuf>,
+    log_failed: bool,
     console: bool,
     message: String,
     error: Option<String>,
@@ -23,21 +29,33 @@ impl Log {
         let root = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA absent")?)
             .join("AudioBridgeRust")
             .join("logs");
+        Self::create_in(root, console)
+    }
+    fn create_in(root: PathBuf, console: bool) -> Result<Self, String> {
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
-        let path = root.join(format!("session-{stamp}-{}.log", std::process::id()));
-        let file = File::create(&path).map_err(|e| e.to_string())?;
+        let path = crate::logging::session_path(&root, stamp, std::process::id());
+        File::create(&path).map_err(|e| e.to_string())?;
+        let cleanup_error = crate::logging::prune_sessions(&root, Some(&path))
+            .err()
+            .map(|e| format!("Nettoyage des anciens journaux impossible : {e}"));
         if console {
             println!("Journal local : {}", path.display());
+            if let Some(error) = &cleanup_error {
+                eprintln!("{error}");
+            }
         }
         Ok(Self {
-            file,
+            file: path,
+            #[cfg(test)]
+            cleanup_root: None,
+            log_failed: false,
             console,
             message: String::new(),
-            error: None,
+            error: cleanup_error,
         })
     }
     fn note(&mut self, text: &str) {
@@ -49,7 +67,11 @@ impl Log {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        if let Err(e) = writeln!(self.file, "{stamp} {text}").and_then(|_| self.file.flush()) {
+        if self.log_failed {
+            return;
+        }
+        if let Err(e) = crate::logging::append(&self.file, &format!("{stamp} {text}"), false) {
+            self.log_failed = true;
             self.error = Some(format!("Journal indisponible : {e}"));
             if self.console {
                 eprintln!("Journal indisponible : {e}");
@@ -57,6 +79,15 @@ impl Log {
         }
     }
 }
+#[cfg(test)]
+impl Drop for Log {
+    fn drop(&mut self) {
+        if let Some(root) = &self.cleanup_root {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}
+
 struct App {
     devices: Vec<Device>,
     connected: bool,
@@ -64,13 +95,16 @@ struct App {
     session: SessionSlot<Session>,
     policy: Policy,
     recovery: Recovery,
+    active_error: Option<String>,
+    state_failures: u8,
+    close_blocked: bool,
     automatic: bool,
     retry_at: Option<Instant>,
     tx: mpsc::Sender<Notice>,
     log: Log,
 }
 impl App {
-    fn snapshot(&self, busy: bool, events: &mpsc::Sender<BackendEvent>) {
+    fn snapshot(&self, busy: bool, events: &EventSender) {
         let _ = events.send(BackendEvent::Snapshot(BackendSnapshot {
             devices: self
                 .devices
@@ -83,21 +117,22 @@ impl App {
             selected_id: self.target.as_ref().map(|d| d.id.to_string()),
             selected_name: self.target.as_ref().map(|d| d.name.clone()),
             connected: self.connected,
+            wanted: self.policy.wanted,
+            retry_pending: self.retry_at.is_some(),
+            session_owned: self.session.0.is_some(),
+            error: self.active_error.clone(),
             busy,
             auto_recovery: self.automatic,
             message: self.log.message.clone(),
         }));
     }
-    fn flush_error(&mut self, events: &mpsc::Sender<BackendEvent>) {
+    fn flush_error(&mut self, events: &EventSender) {
         if let Some(error) = self.log.error.take() {
+            self.active_error = Some(error.clone());
             let _ = events.send(BackendEvent::Error(error));
         }
     }
-    fn backend_command(
-        &mut self,
-        command: BackendCommand,
-        events: &mpsc::Sender<BackendEvent>,
-    ) -> bool {
+    fn backend_command(&mut self, command: BackendCommand, events: &EventSender) -> bool {
         self.snapshot(true, events);
         let mut running = true;
         match command {
@@ -165,19 +200,25 @@ impl App {
 
     fn release(&mut self, voluntary: bool) -> bool {
         self.retry_at = None;
+        self.close_blocked = false;
+        self.connected = false;
+        self.state_failures = 0;
         // Invalidate callbacks before calling into Windows; callbacks never mutate app state.
         self.policy.disconnect();
         if !voluntary {
             self.policy.wanted = true;
         }
         if let Err(e) = self.session.release(Session::close) {
+            self.close_blocked = true;
             self.log.note(&format!(
                 "Fermeture en echec : {e}. Aucune nouvelle session ne sera creee."
             ));
             self.log.error = Some(self.log.message.clone());
             return false;
         }
-        self.connected = false;
+        if voluntary {
+            self.active_error = None;
+        }
         true
     }
     fn schedule(&mut self) {
@@ -217,6 +258,8 @@ impl App {
         ) {
             Ok(()) => {
                 self.connected = true;
+                self.state_failures = 0;
+                self.active_error = None;
                 self.log.note(
                     "Session ouverte. Etat de connexion uniquement : son audible non verifie.",
                 );
@@ -303,17 +346,17 @@ impl App {
                 Err(error) => self.log.note(&error),
             },
             ["status"] => {
-                if let Some(session) = &self.session.0 {
-                    match session.state() {
-                        Ok(s) => self.log.note(&format!(
-                            "Etat Windows : {}. Son audible non verifie.",
-                            if s == 1 { "ouvert" } else { "ferme" }
-                        )),
-                        Err(e) => self.log.note(&format!("Etat Windows indisponible : {e}")),
-                    }
+                self.poll_state(true);
+                let status = if self.close_blocked {
+                    "Fermeture non confirmee ; intervention utilisateur necessaire"
+                } else if self.connected {
+                    "Etat Windows : ouvert. Son audible non verifie."
+                } else if self.session.0.is_some() {
+                    "Etat Windows indisponible ; connexion non confirmee"
                 } else {
-                    self.log.note("Aucune session");
-                }
+                    "Aucune session"
+                };
+                self.log.note(status);
                 self.log.note(&format!(
                     "Auto : {} ; recuperation en attente : {}",
                     self.automatic,
@@ -325,15 +368,76 @@ impl App {
         true
     }
     fn observe(&mut self, notice: Notice) {
-        if !self.policy.accepts(notice.generation) {
+        if self.policy.accepts(notice.generation) {
+            // Stale notifications cannot override the current Windows state.
+            self.poll_state(false);
+        }
+    }
+    fn poll_state(&mut self, count_failure: bool) {
+        // A failed close requires explicit user action; never loop close/create.
+        if self.close_blocked {
             return;
         }
-        self.connected = self.session.0.as_ref().and_then(|s| s.state().ok()) == Some(1);
-        // Ignore an old Closed notification if the same session has already reopened.
-        if notice.state == 0 && self.session.0.as_ref().and_then(|s| s.state().ok()) == Some(0) {
-            self.log.note("Fermeture inattendue signalee par Windows");
-            if self.release(false) {
-                self.schedule();
+        let Some(session) = &self.session.0 else {
+            return;
+        };
+        let state = session.state().map_err(|e| e.to_string());
+        self.apply_state(state, count_failure);
+    }
+    fn apply_state(
+        &mut self,
+        state: Result<windows::Media::Audio::AudioPlaybackConnectionState, String>,
+        count_failure: bool,
+    ) {
+        use windows::Media::Audio::AudioPlaybackConnectionState as State;
+        match state {
+            Ok(State::Opened) => {
+                self.state_failures = 0;
+                self.connected = true;
+                // Only a state-read error is resolved by a successful observation.
+                if self
+                    .active_error
+                    .as_ref()
+                    .is_some_and(|e| e.starts_with("Etat Windows indisponible"))
+                {
+                    self.active_error = None;
+                    self.log
+                        .note("Etat Windows confirme ouvert. Son audible non verifie.");
+                }
+            }
+            Ok(State::Closed) => {
+                self.state_failures = 0;
+                self.connected = false;
+                self.log.note("Fermeture inattendue signalee par Windows");
+                let wanted = self.policy.wanted;
+                if self.release(!wanted) && wanted {
+                    self.schedule();
+                }
+            }
+            other => {
+                self.connected = false;
+                let detail = match other {
+                    Err(error) => error,
+                    Ok(state) => format!("etat inconnu {}", state.0),
+                };
+                if self.state_failures == 0
+                    && !self
+                        .active_error
+                        .as_ref()
+                        .is_some_and(|e| e.starts_with("Etat Windows indisponible"))
+                {
+                    let error = format!("Etat Windows indisponible : {detail}");
+                    self.log.note(&error);
+                    self.log.error = Some(error.clone());
+                    self.active_error = Some(error);
+                }
+                if count_failure {
+                    self.state_failures = self.state_failures.saturating_add(1);
+                    // Three consecutive periodic failures: close before bounded recovery.
+                    if self.state_failures == 3 && self.policy.wanted && self.release(false) {
+                        self.schedule();
+                    }
+                }
             }
         }
     }
@@ -342,7 +446,7 @@ impl App {
 /// Starts the serialized Bluetooth owner. Startup acknowledgement never enumerates devices.
 pub fn spawn_worker() -> Result<BackendHandle, String> {
     let (commands, input) = mpsc::channel();
-    let (events, output) = mpsc::channel();
+    let (events, output) = event_channel();
     let (ready, startup) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("AudioBridge backend".into())
@@ -358,6 +462,9 @@ pub fn spawn_worker() -> Result<BackendHandle, String> {
                     session: SessionSlot(None),
                     policy: Policy::default(),
                     recovery: Recovery::default(),
+                    active_error: None,
+                    state_failures: 0,
+                    close_blocked: false,
                     automatic: false,
                     retry_at: None,
                     tx,
@@ -377,6 +484,7 @@ pub fn spawn_worker() -> Result<BackendHandle, String> {
             }
             app.log.note("Pret. Recuperation automatique desactivee.");
             app.snapshot(false, &events);
+            app.flush_error(&events);
             let mut next_poll = Instant::now();
             loop {
                 match input.recv_timeout(Duration::from_millis(100)) {
@@ -401,7 +509,6 @@ pub fn spawn_worker() -> Result<BackendHandle, String> {
                     break;
                 }
                 for notice in notices.try_iter() {
-                    app.snapshot(true, &events);
                     app.observe(notice);
                     app.flush_error(&events);
                     app.snapshot(false, &events);
@@ -409,13 +516,7 @@ pub fn spawn_worker() -> Result<BackendHandle, String> {
                 if Instant::now() >= next_poll {
                     next_poll = Instant::now() + Duration::from_secs(1);
                     if app.session.0.is_some() {
-                        app.snapshot(true, &events);
-                        if let Some(state) = app.session.0.as_ref().and_then(|s| s.state().ok()) {
-                            app.observe(Notice {
-                                generation: app.policy.generation,
-                                state,
-                            });
-                        }
+                        app.poll_state(true);
                         app.flush_error(&events);
                         app.snapshot(false, &events);
                     }
@@ -454,6 +555,9 @@ pub fn run() -> Result<(), String> {
         session: SessionSlot(None),
         policy: Policy::default(),
         recovery: Recovery::default(),
+        active_error: None,
+        state_failures: 0,
+        close_blocked: false,
         automatic: false,
         retry_at: None,
         tx: event_tx,
@@ -475,7 +579,7 @@ pub fn run() -> Result<(), String> {
         }
     });
     let mut next_poll = Instant::now();
-    loop {
+    'console: loop {
         // User commands take precedence over pending automatic recovery.
         match input_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(command) => {
@@ -486,17 +590,17 @@ pub fn run() -> Result<(), String> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+        for command in input_rx.try_iter() {
+            if !app.command(&command) {
+                break 'console;
+            }
+        }
         for notice in event_rx.try_iter() {
             app.observe(notice);
         }
         if Instant::now() >= next_poll {
             next_poll = Instant::now() + Duration::from_secs(1);
-            if let Some(state) = app.session.0.as_ref().and_then(|s| s.state().ok()) {
-                app.observe(Notice {
-                    generation: app.policy.generation,
-                    state,
-                });
-            }
+            app.poll_state(true);
         }
         if app.retry_at.is_some_and(|when| Instant::now() >= when) {
             app.connect();
@@ -513,15 +617,14 @@ pub fn run() -> Result<(), String> {
 mod backend_tests {
     use super::*;
     #[test]
-    fn unknown_id_is_rejected_without_changing_intent_and_busy_is_bracketed() {
+    fn unknown_id_is_rejected_without_changing_intent_and_finishes_idle() {
         let mut app = test_app();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = event_channel();
         assert!(app.backend_command(
             crate::protocol::BackendCommand::Connect("stale-id".into()),
             &tx
         ));
         let events: Vec<_> = rx.try_iter().collect();
-        assert!(matches!(&events[0], crate::protocol::BackendEvent::Snapshot(s) if s.busy));
         assert!(
             matches!(events.last().unwrap(), crate::protocol::BackendEvent::Snapshot(s) if !s.busy && !s.connected && s.selected_id.is_none())
         );
@@ -536,13 +639,115 @@ mod backend_tests {
     #[test]
     fn repair_without_target_reports_error_without_changing_intent() {
         let mut app = test_app();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = event_channel();
         app.backend_command(BackendCommand::Repair, &tx);
         assert!(rx.try_iter().any(|e| matches!(e, BackendEvent::Error(_))));
         assert!(!app.policy.wanted);
         assert_eq!(app.policy.generation, 0);
         assert!(app.target.is_none());
         assert!(!app.automatic);
+    }
+    #[test]
+    fn regression_locked_old_log_is_nonfatal_and_reported_once() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "ab-locked-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let old = crate::logging::session_path(&root, 0, 7);
+        fs::write(&old, vec![b'x'; crate::logging::MAX_BYTES as usize + 1]).unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately no FILE_SHARE_DELETE.
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&old)
+            .unwrap();
+        let result = Log::create_in(root.clone(), false);
+        assert!(
+            result.is_ok(),
+            "old locked log must not block startup: {:?}",
+            result.as_ref().err()
+        );
+        let mut log = result.unwrap();
+        assert!(!log.log_failed);
+        assert!(
+            log.error
+                .as_deref()
+                .is_some_and(|e| e.contains("Nettoyage"))
+        );
+        log.note("current log remains writable");
+        assert!(
+            fs::read_to_string(&log.file)
+                .unwrap()
+                .contains("current log remains writable")
+        );
+        let mut app = test_app();
+        app.log = log;
+        let (tx, rx) = event_channel();
+        app.flush_error(&tx);
+        app.log.note("still writable after reporting");
+        app.flush_error(&tx);
+        assert_eq!(
+            rx.try_iter()
+                .filter(|e| matches!(e, BackendEvent::Error(_)))
+                .count(),
+            1
+        );
+        assert!(old.exists());
+        drop(locked);
+        fs::remove_file(old).unwrap();
+        fs::remove_file(&app.log.file).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn regression_future_logs_keep_active_session_and_five_file_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "ab-future-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for n in 0..5 {
+            fs::write(
+                crate::logging::session_path(&root, u128::MAX - n, 7),
+                "future",
+            )
+            .unwrap();
+        }
+        let foreign = root.join("session-personal-notes.log");
+        fs::write(&foreign, "preserve").unwrap();
+        let mut log = Log::create_in(root.clone(), false).unwrap();
+        assert!(
+            log.file.exists(),
+            "active session must survive future timestamp retention"
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            6,
+            "active plus four older sessions and foreign file"
+        );
+        log.note("append after pruning");
+        assert!(!log.log_failed);
+        assert!(
+            fs::read_to_string(&log.file)
+                .unwrap()
+                .contains("append after pruning")
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            6,
+            "append must not recreate a sixth session"
+        );
+        assert_eq!(fs::read_to_string(foreign).unwrap(), "preserve");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn worker_startup_ack_quit_and_single_instance_without_bluetooth() {
@@ -569,7 +774,7 @@ mod backend_tests {
     #[test]
     fn auto_and_repair_commands_never_invent_connection_intent() {
         let mut app = test_app();
-        let (tx, _) = mpsc::channel();
+        let (tx, _) = event_channel();
         for command in [
             BackendCommand::SetAuto(true),
             BackendCommand::SetAuto(false),
@@ -582,6 +787,81 @@ mod backend_tests {
             assert!(!app.connected);
         }
     }
+    #[test]
+    fn cancel_pending_recovery_invalidates_callbacks_without_toggling_preference() {
+        let mut app = test_app();
+        app.automatic = true;
+        let old = app.policy.begin().unwrap();
+        app.schedule();
+        assert!(app.retry_at.is_some());
+        let (tx, rx) = event_channel();
+        app.backend_command(BackendCommand::Disconnect, &tx);
+        assert!(app.retry_at.is_none());
+        assert!(!app.policy.wanted);
+        assert!(app.automatic);
+        app.observe(Notice { generation: old });
+        assert!(!app.connected);
+        assert!(!app.policy.wanted);
+        let snapshot = rx
+            .try_iter()
+            .find_map(|event| match event {
+                BackendEvent::Snapshot(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!snapshot.wanted && !snapshot.retry_pending);
+    }
+    #[test]
+    fn transient_state_failure_is_visible_then_resolved_without_recovery() {
+        use windows::Media::Audio::AudioPlaybackConnectionState as State;
+        let mut app = test_app();
+        app.policy.begin();
+        app.connected = true;
+        app.automatic = true;
+        app.apply_state(Err("read failed".into()), true);
+        assert!(!app.connected);
+        let (tx, _) = event_channel();
+        app.flush_error(&tx);
+        assert!(app.active_error.is_some());
+        app.apply_state(Ok(State::Opened), true);
+        assert!(app.connected);
+        assert!(app.active_error.is_none());
+        assert!(app.retry_at.is_none());
+        app.active_error = Some("diagnostic failure".into());
+        app.apply_state(Ok(State::Opened), true);
+        assert_eq!(app.active_error.as_deref(), Some("diagnostic failure"));
+    }
+    #[test]
+    fn persistent_failures_close_before_bounded_recovery_and_respect_user_policy() {
+        for automatic in [false, true] {
+            let mut app = test_app();
+            app.policy.begin();
+            app.automatic = automatic;
+            for n in 1..=3 {
+                app.apply_state(Err("read failed".into()), true);
+                if n < 3 {
+                    assert!(app.retry_at.is_none());
+                }
+            }
+            assert_eq!(app.retry_at.is_some(), automatic);
+            assert!(!app.connected);
+            assert!(app.session.0.is_none());
+            assert!(app.policy.wanted);
+        }
+        let mut app = test_app();
+        app.automatic = true;
+        for _ in 0..10 {
+            app.apply_state(Err("read failed".into()), true);
+        }
+        assert!(app.retry_at.is_none());
+        assert!(!app.policy.wanted);
+        app.apply_state(
+            Ok(windows::Media::Audio::AudioPlaybackConnectionState::Closed),
+            true,
+        );
+        assert!(!app.policy.wanted);
+        assert!(app.retry_at.is_none());
+    }
     fn test_app() -> App {
         let (tx, _) = mpsc::channel();
         App {
@@ -591,10 +871,35 @@ mod backend_tests {
             session: SessionSlot(None),
             policy: Policy::default(),
             recovery: Recovery::default(),
+            active_error: None,
+            state_failures: 0,
+            close_blocked: false,
             automatic: false,
             retry_at: None,
             tx,
-            log: Log::new().unwrap(),
+            log: {
+                // Each fixture owns a private root: production retention must not
+                // remove another concurrently running test's open log on Windows.
+                let root = std::env::temp_dir().join(format!(
+                    "audio-bridge-fixture-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                fs::create_dir_all(&root).unwrap();
+                let file = root.join("test.log");
+                File::create(&file).unwrap();
+                Log {
+                    file,
+                    cleanup_root: Some(root),
+                    log_failed: false,
+                    console: false,
+                    message: String::new(),
+                    error: None,
+                }
+            },
         }
     }
 }
@@ -627,21 +932,28 @@ mod diagnostic_tests {
             session: SessionSlot(None),
             policy: Policy::default(),
             recovery: Recovery::default(),
+            active_error: None,
+            state_failures: 0,
+            close_blocked: false,
             automatic: false,
             retry_at: None,
             tx,
             log: Log {
-                file: File::create(&path).unwrap(),
+                cleanup_root: None,
+                file: {
+                    File::create(&path).unwrap();
+                    path.clone()
+                },
+                log_failed: false,
                 console: false,
                 message: String::new(),
                 error: None,
             },
         };
         assert!(app.command("diagnose"));
-        let (events, received) = mpsc::channel();
+        let (events, received) = event_channel();
         app.backend_command(BackendCommand::Diagnose, &events);
         let emitted: Vec<_> = received.try_iter().collect();
-        assert!(matches!(&emitted[0], BackendEvent::Snapshot(s) if s.busy));
         let report_path = emitted
             .iter()
             .find_map(|e| match e {
