@@ -7,10 +7,15 @@ use std::{
 pub const MAX_BYTES: u64 = 1024 * 1024;
 const SESSION_FILES: usize = 5;
 
-pub fn prune_sessions(root: &Path) -> io::Result<()> {
+/// Reserve one slot for the active session, which must never be pruned.
+/// With no active session, all five slots are available for retained logs.
+pub fn prune_sessions(root: &Path, active: Option<&Path>) -> io::Result<()> {
     let mut files = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
+        if active.is_some_and(|path| path == entry.path()) {
+            continue;
+        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -43,7 +48,7 @@ pub fn prune_sessions(root: &Path) -> io::Result<()> {
     }
     files.sort_by_key(|(stamp, _, _)| std::cmp::Reverse(*stamp));
     for (index, (_, path, bytes)) in files.into_iter().enumerate() {
-        if index >= SESSION_FILES || bytes > MAX_BYTES {
+        if index >= SESSION_FILES - usize::from(active.is_some()) || bytes > MAX_BYTES {
             fs::remove_file(path)?;
         }
     }
@@ -107,7 +112,7 @@ mod tests {
         }
         let foreign = root.join("session-personal-notes.log");
         fs::write(&foreign, "preserve").unwrap();
-        prune_sessions(&root).unwrap();
+        prune_sessions(&root, None).unwrap();
         assert_eq!(fs::read_dir(&root).unwrap().count(), 6);
         assert_eq!(fs::read_to_string(&foreign).unwrap(), "preserve");
         let tray = root.join("tray.log");

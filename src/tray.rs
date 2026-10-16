@@ -64,6 +64,39 @@ fn icon_frame(bytes: &[u8]) -> Result<&[u8], String> {
         .ok_or_else(|| "Aucune image ICO valide".into())
 }
 
+struct TooltipState {
+    last_applied: String,
+    retry_at: Option<std::time::Instant>,
+}
+impl TooltipState {
+    fn new(last_applied: String) -> Self {
+        Self {
+            last_applied,
+            retry_at: None,
+        }
+    }
+    // Returns true only for the first failure in an uninterrupted failure streak.
+    fn update(
+        &mut self,
+        desired: &str,
+        now: std::time::Instant,
+        apply: impl FnOnce(&str) -> bool,
+    ) -> bool {
+        if desired == self.last_applied || self.retry_at.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        if apply(desired) {
+            self.last_applied = desired.to_owned();
+            self.retry_at = None;
+            false
+        } else {
+            let first_failure = self.retry_at.is_none();
+            self.retry_at = Some(now + std::time::Duration::from_secs(1));
+            first_failure
+        }
+    }
+}
+
 const CLOSE: u8 = 1;
 const RESTORE: u8 = 2;
 #[derive(Default)]
@@ -449,7 +482,7 @@ mod native {
             message: "Inventaire en cours…".into(),
             ..Default::default()
         };
-        let mut last_tip = "Audio Bridge — Libre".to_owned();
+        let mut tooltip = TooltipState::new("Audio Bridge — Libre".to_owned());
         let mut closing = false;
         let mut failed = false;
         let started = Instant::now();
@@ -553,15 +586,20 @@ mod native {
                     chosen = 9;
                 }
                 let next_tip = tip(&snapshot, closing, failed);
-                if next_tip != last_tip {
-                    let text = wide(&next_tip);
-                    tray.0.szTip.fill(0);
-                    let count = text.len().min(tray.0.szTip.len() - 1);
-                    tray.0.szTip[..count].copy_from_slice(&text[..count]);
-                    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &tray.0) }.as_bool() {
-                        log("NIM_MODIFY failed; next visible change or TaskbarCreated will retry");
+                if tooltip.update(&next_tip, Instant::now(), |desired| {
+                    // Keep the restore payload consistent with the last successful update.
+                    let mut candidate = tray.0;
+                    let text = wide(desired);
+                    candidate.szTip.fill(0);
+                    let count = text.len().min(candidate.szTip.len() - 1);
+                    candidate.szTip[..count].copy_from_slice(&text[..count]);
+                    let applied = unsafe { Shell_NotifyIconW(NIM_MODIFY, &candidate) }.as_bool();
+                    if applied {
+                        tray.0 = candidate;
                     }
-                    last_tip = next_tip;
+                    applied
+                }) {
+                    log("NIM_MODIFY failed; retrying at most once per second");
                 }
             }
             if let Some(cmd) = route(chosen, &snapshot, closing) {
@@ -608,6 +646,47 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tooltip_retry_retains_success_and_bounds_attempts_and_error_logs() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut policy = TooltipState::new("old".into());
+        let mut calls = 0;
+        {
+            let mut apply = |_: &str| {
+                calls += 1;
+                false
+            };
+            assert!(policy.update("new", start, &mut apply));
+            assert_eq!(
+                policy.last_applied, "old",
+                "failed update must not be acknowledged"
+            );
+            assert!(!policy.update("new", start + Duration::from_millis(999), &mut apply));
+            assert!(!policy.update("new", start + Duration::from_secs(1), &mut apply));
+            assert!(!policy.update("different", start + Duration::from_millis(1500), &mut apply));
+        }
+        assert_eq!(
+            calls, 2,
+            "failures retry at most once per second, even if desired changes"
+        );
+        assert_eq!(policy.last_applied, "old");
+        assert!(!policy.update("new", start + Duration::from_secs(2), |_| {
+            calls += 1;
+            true
+        }));
+        assert_eq!(policy.last_applied, "new");
+        assert!(
+            !policy.update("new", start + Duration::from_secs(3), |_| panic!(
+                "redundant Shell call"
+            ))
+        );
+        assert_eq!(calls, 3);
+        assert!(
+            policy.update("next", start + Duration::from_secs(3), |_| false),
+            "success resets error suppression"
+        );
+    }
     #[test]
     fn routing_preserves_opaque_ids_and_blocks_busy_mutations() {
         let mut s = BackendSnapshot {

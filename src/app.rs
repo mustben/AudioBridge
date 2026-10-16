@@ -29,6 +29,9 @@ impl Log {
         let root = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA absent")?)
             .join("AudioBridgeRust")
             .join("logs");
+        Self::create_in(root, console)
+    }
+    fn create_in(root: PathBuf, console: bool) -> Result<Self, String> {
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -36,9 +39,14 @@ impl Log {
             .as_nanos();
         let path = crate::logging::session_path(&root, stamp, std::process::id());
         File::create(&path).map_err(|e| e.to_string())?;
-        crate::logging::prune_sessions(&root).map_err(|e| e.to_string())?;
+        let cleanup_error = crate::logging::prune_sessions(&root, Some(&path))
+            .err()
+            .map(|e| format!("Nettoyage des anciens journaux impossible : {e}"));
         if console {
             println!("Journal local : {}", path.display());
+            if let Some(error) = &cleanup_error {
+                eprintln!("{error}");
+            }
         }
         Ok(Self {
             file: path,
@@ -47,7 +55,7 @@ impl Log {
             log_failed: false,
             console,
             message: String::new(),
-            error: None,
+            error: cleanup_error,
         })
     }
     fn note(&mut self, text: &str) {
@@ -476,6 +484,7 @@ pub fn spawn_worker() -> Result<BackendHandle, String> {
             }
             app.log.note("Pret. Recuperation automatique desactivee.");
             app.snapshot(false, &events);
+            app.flush_error(&events);
             let mut next_poll = Instant::now();
             loop {
                 match input.recv_timeout(Duration::from_millis(100)) {
@@ -637,6 +646,108 @@ mod backend_tests {
         assert_eq!(app.policy.generation, 0);
         assert!(app.target.is_none());
         assert!(!app.automatic);
+    }
+    #[test]
+    fn regression_locked_old_log_is_nonfatal_and_reported_once() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "ab-locked-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let old = crate::logging::session_path(&root, 0, 7);
+        fs::write(&old, vec![b'x'; crate::logging::MAX_BYTES as usize + 1]).unwrap();
+        // FILE_SHARE_READ | FILE_SHARE_WRITE, deliberately no FILE_SHARE_DELETE.
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&old)
+            .unwrap();
+        let result = Log::create_in(root.clone(), false);
+        assert!(
+            result.is_ok(),
+            "old locked log must not block startup: {:?}",
+            result.as_ref().err()
+        );
+        let mut log = result.unwrap();
+        assert!(!log.log_failed);
+        assert!(
+            log.error
+                .as_deref()
+                .is_some_and(|e| e.contains("Nettoyage"))
+        );
+        log.note("current log remains writable");
+        assert!(
+            fs::read_to_string(&log.file)
+                .unwrap()
+                .contains("current log remains writable")
+        );
+        let mut app = test_app();
+        app.log = log;
+        let (tx, rx) = event_channel();
+        app.flush_error(&tx);
+        app.log.note("still writable after reporting");
+        app.flush_error(&tx);
+        assert_eq!(
+            rx.try_iter()
+                .filter(|e| matches!(e, BackendEvent::Error(_)))
+                .count(),
+            1
+        );
+        assert!(old.exists());
+        drop(locked);
+        fs::remove_file(old).unwrap();
+        fs::remove_file(&app.log.file).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn regression_future_logs_keep_active_session_and_five_file_bound() {
+        let root = std::env::temp_dir().join(format!(
+            "ab-future-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for n in 0..5 {
+            fs::write(
+                crate::logging::session_path(&root, u128::MAX - n, 7),
+                "future",
+            )
+            .unwrap();
+        }
+        let foreign = root.join("session-personal-notes.log");
+        fs::write(&foreign, "preserve").unwrap();
+        let mut log = Log::create_in(root.clone(), false).unwrap();
+        assert!(
+            log.file.exists(),
+            "active session must survive future timestamp retention"
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            6,
+            "active plus four older sessions and foreign file"
+        );
+        log.note("append after pruning");
+        assert!(!log.log_failed);
+        assert!(
+            fs::read_to_string(&log.file)
+                .unwrap()
+                .contains("append after pruning")
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            6,
+            "append must not recreate a sixth session"
+        );
+        assert_eq!(fs::read_to_string(foreign).unwrap(), "preserve");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn worker_startup_ack_quit_and_single_instance_without_bluetooth() {
