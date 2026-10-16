@@ -1,6 +1,7 @@
 pub mod app;
 pub mod audio_diagnostics;
 pub mod diagnostic_report;
+pub mod logging;
 pub mod platform;
 pub mod protocol;
 pub const HELP: &str = include_str!("help.txt");

@@ -109,7 +109,6 @@ impl Drop for Instance {
 #[derive(Debug)]
 pub struct Notice {
     pub generation: u64,
-    pub state: i32,
 }
 
 pub struct Session {
@@ -130,13 +129,9 @@ impl Session {
         };
         session.token = Some(session.connection.StateChanged(&TypedEventHandler::new(
             move |sender: &Option<AudioPlaybackConnection>, _| {
-                if let Some(sender) = sender {
-                    if let Ok(state) = sender.State() {
-                        let _ = tx.send(Notice {
-                            generation,
-                            state: state.0,
-                        });
-                    }
+                // Notification is only a hint; the owner performs one authoritative read.
+                if sender.is_some() {
+                    let _ = tx.send(Notice { generation });
                 }
                 Ok(())
             },
@@ -166,8 +161,8 @@ impl Session {
             }
         }
     }
-    pub fn state(&self) -> Result<i32> {
-        Ok(self.connection.State()?.0)
+    pub fn state(&self) -> Result<windows::Media::Audio::AudioPlaybackConnectionState> {
+        self.connection.State()
     }
     pub fn close(&mut self) -> Result<()> {
         if let Some(token) = self.token.take() {
