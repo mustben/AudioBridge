@@ -14,6 +14,8 @@ use std::{
 
 struct Log {
     file: PathBuf,
+    #[cfg(test)]
+    cleanup_root: Option<PathBuf>,
     log_failed: bool,
     console: bool,
     message: String,
@@ -40,6 +42,8 @@ impl Log {
         }
         Ok(Self {
             file: path,
+            #[cfg(test)]
+            cleanup_root: None,
             log_failed: false,
             console,
             message: String::new(),
@@ -67,6 +71,15 @@ impl Log {
         }
     }
 }
+#[cfg(test)]
+impl Drop for Log {
+    fn drop(&mut self) {
+        if let Some(root) = &self.cleanup_root {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}
+
 struct App {
     devices: Vec<Device>,
     connected: bool,
@@ -753,7 +766,29 @@ mod backend_tests {
             automatic: false,
             retry_at: None,
             tx,
-            log: Log::new().unwrap(),
+            log: {
+                // Each fixture owns a private root: production retention must not
+                // remove another concurrently running test's open log on Windows.
+                let root = std::env::temp_dir().join(format!(
+                    "audio-bridge-fixture-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                fs::create_dir_all(&root).unwrap();
+                let file = root.join("test.log");
+                File::create(&file).unwrap();
+                Log {
+                    file,
+                    cleanup_root: Some(root),
+                    log_failed: false,
+                    console: false,
+                    message: String::new(),
+                    error: None,
+                }
+            },
         }
     }
 }
@@ -793,6 +828,7 @@ mod diagnostic_tests {
             retry_at: None,
             tx,
             log: Log {
+                cleanup_root: None,
                 file: {
                     File::create(&path).unwrap();
                     path.clone()
