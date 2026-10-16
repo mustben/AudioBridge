@@ -16,7 +16,13 @@ Pair the phone in Windows Bluetooth settings first. Right-click AudioBridge, ref
 
 The menu provides device selection, refresh, disconnect, rebuild connection, optional recovery, a local audio diagnostic, logs, Windows Bluetooth settings, About, and Quit. The interface is currently French. There is no browser window or console in the tray application. Quit explicitly closes its session; it does not leave a service running.
 
-**Automatic recovery is off on every launch.** When enabled it retries a failed/closed session at most three times with 2/4/8-second delays per explicit request. It does not reconnect merely because the stream is silent. A slow operation runs on a separate owner thread; the menu stays responsive, but Quit can wait for the current Windows operation to finish.
+**Automatic recovery is off on every launch.** When enabled it retries a failed/closed session at most three times with 2/4/8-second delays per explicit request. It does not reconnect merely because the stream is silent. A slow operation runs on a separate owner thread; the menu stays responsive, but Disconnect and Quit can wait for the current Windows operation to finish. Disconnect remains available during recovery and while an operation runs; its queued cancellation is processed before subsequent automatic recovery, without disabling the recovery preference.
+
+State reads that fail immediately remove the confirmed-connection indication. Three consecutive periodic failures cause a close, followed by the existing bounded recovery only if enabled and still wanted. A failed close retains the session and blocks automatic operations until explicit Disconnect/Repair. Periodic checks and unrelated actions do not acknowledge an error; a confirmed open resolves a state-read error, while successful connection/disconnection resolves the connection operation's error.
+
+UI state storage keeps only the latest snapshot while menus/dialogs are open. Errors, reports and shutdown events remain ordered and lossless, and are consumed after the modal call returns using the existing 100 ms timer; no reentrant UI work is introduced. Stable checks no longer log snapshots or modify the tray tooltip. A failed tooltip update is retried on a bounded timer until applied, without repeated error logging. The icon is re-added on `TaskbarCreated`.
+
+Logs in `%LOCALAPPDATA%\AudioBridgeRust\logs` target a 7 MiB total: `tray.log` plus one previous segment, and the active session plus four other `session-<timestamp>-<pid>.log` files, each written segment at most 1 MiB (excluding diagnostic reports and foreign files). The active session is protected from retention even after a clock rollback. A full session log starts a new segment in the same file; older content is discarded. Startup removes older/oversized recognized session logs, and the first tray write handles oversized legacy tray logs. If cleanup is blocked, it is reported without preventing audio startup; the total bound cannot be guaranteed until cleanup succeeds. Failure to write a log is reported once and disables that writer until restart.
 
 ## Requirements and limits
 
@@ -48,7 +54,7 @@ The CLI supports `--help`, `--list`, `--diagnose`, or its interactive console. D
 
 ## Community and publication
 
-This folder is prepared for GitHub, but a local build does not mean GitHub CI has run. The included Windows CI builds/tests/packages; the release workflow runs only manually and creates a **draft prerelease**, never an automatic public release. See [PUBLISHING.md](PUBLISHING.md).
+The baseline commit `0debb364` passed [Windows CI](https://github.com/mustben/AudioBridge/actions/runs/38798694441). Each subsequent change needs its own CI result; see [VERIFICATION.md](VERIFICATION.md). The included Windows CI builds/tests/packages; the release workflow runs only manually and creates a **draft prerelease**, never an automatic public release. See [PUBLISHING.md](PUBLISHING.md).
 
 No automatic update checker or updater is implemented. Downloaded updates are applied manually while the old application is closed.
 

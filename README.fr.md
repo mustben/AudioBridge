@@ -34,3 +34,13 @@ Binaire de développement non signé : le projet ne demande pas de désactiver l
 La version console optionnelle s'appelle AudioBridge-CLI.exe. Pour désinstaller : quitter, supprimer le dossier et éventuellement `%LOCALAPPDATA%\AudioBridgeRust` contenant journaux/rapports.
 
 Voir README.md pour construire, CONTRIBUTING.md pour tester et PUBLISHING.md pour préparer la publication. Licence MIT ; notices des dépendances incluses. Les workflows GitHub sont préparés, mais leur succès ne peut être affirmé avant exécution sur le dépôt distant.
+
+## Annulation, erreurs et journaux
+
+« Déconnecter » reste disponible pendant le délai de récupération et une opération en cours. L’annulation est mise en file : elle attend le retour de l’appel Windows et passe avant la prochaine récupération automatique. La préférence de récupération reste inchangée.
+
+Une lecture d’état Windows en échec retire immédiatement la confirmation de connexion. Trois contrôles périodiques consécutifs en échec entraînent une fermeture, puis une récupération uniquement si elle est activée et toujours souhaitée. Un échec de fermeture conserve la session et bloque les opérations automatiques jusqu’à une action explicite. Un simple contrôle ou une action sans rapport n’efface pas l’erreur.
+
+Pendant un menu ou dialogue modal, seul le dernier instantané est conservé ; erreurs, rapports et arrêt restent en file et sont traités au retour du dialogue. Les contrôles stables n’écrivent plus de traces et ne modifient plus l’infobulle. Une mise à jour d’infobulle échouée est réessayée de façon temporisée jusqu’à application, sans répéter les mêmes erreurs dans le journal.
+
+Les journaux visent une limite totale de 7 Mio : la session active et quatre autres fichiers de session, plus `tray.log` avec un segment précédent, chaque segment écrit faisant au maximum 1 Mio. La session active est protégée du nettoyage, même après un recul de l’horloge. Les anciens segments de session sont écrasés et les sessions les plus anciennes supprimées au lancement. Les anciens journaux reconnus trop volumineux sont supprimés lors de cette migration. Si le nettoyage est bloqué, il est signalé sans empêcher le démarrage audio ; la limite totale ne peut alors être garantie avant un nettoyage réussi. Les rapports de diagnostic et fichiers étrangers sont exclus de cette rétention. En cas d’échec d’écriture, un seul signalement est produit puis ce journal est désactivé jusqu’au redémarrage.
