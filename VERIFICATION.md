@@ -2,7 +2,7 @@
 
 This report covers local Windows x64 execution and the separately recorded GitHub CI investigation. It is not a Bluetooth stability certification or an iPhone compatibility claim.
 
-## Local build and tests
+## Local build and tests (initial preview)
 
 - Rust formatting was applied and checked.
 - `cargo +stable test --locked --all-targets` passed: 22 successful tests, 3 hardware-environment tests explicitly ignored.
@@ -38,7 +38,7 @@ The tray routing tests cover stable opaque device IDs, busy-action exclusion, Qu
 - Explorer/taskbar recreation support is implemented but was not tested by restarting the user's Explorer session.
 - Sources were published with the owner's approval to `https://github.com/mustben/AudioBridge`, branch `develop`. The first Windows CI run (38796430697) passed formatting, Rust tests and Clippy, then failed license consistency because Git's Windows checkout changed line endings. That failure was reproduced in a fresh clone. The correction preserves copied license bytes with `.gitattributes` and writes generated notices with explicit LF; the consistency guard remains enabled. The corrected commit `0debb36439bb7acd4cf669978ff9726758773fba` passed [Windows CI run 38798694441](https://github.com/mustben/AudioBridge/actions/runs/38798694441), rechecked through GitHub on 2026-10-16. This result applies only to that commit. No tag or release has been created.
 
-## Final independent review
+## Final independent review (initial preview)
 
 The final targeted independent review accepted all four previously blocking corrections: trusted Notepad resolution, durable modal control requests, x64/subsystem validation and complete portable documentation links. It identified no remaining blocker in the reviewed scope. This is a code review result, not a remote GitHub CI run or a hardware playback certification.
 
@@ -60,3 +60,17 @@ Local Linux validation of this change:
 - `python scripts/test_export_licenses.py`: four passing regressions. No dependency or lockfile changes.
 
 The complete Windows suite passed on commit `7a2e8af60f0522c6559d416a016b5a494d7ee467`: [Windows CI run 38875799187](https://github.com/mustben/AudioBridge/actions/runs/38875799187), 30 tests passed and 3 hardware tests intentionally ignored. Formatting, Clippy, dependency license consistency, release compilation and packaging all succeeded. The following documentation/package-manifest update includes `CORRECTIONS.md` in the portable archive; the latest PR CI remains authoritative for that final commit. Hardware playback, repeated state-read failures from a real adapter, disconnect during a real Windows open, sleep/resume, long modal menus and Explorer recreation have not been executed in this Linux session. No measured CPU/RAM benefit is claimed.
+
+## Follow-up review fixes R1–R3 — Windows verification
+
+The original AB-01–AB-05 commits and behavior are retained. The review of `66e72e09` led to three focused fixes, documented in `CORRECTIONS.md`.
+
+- `cargo +stable test --locked --offline --all-targets`: **33 passed, 3 hardware-dependent tests ignored**.
+- `python scripts/test_export_licenses.py`: **4 passed**; the real offline export of 19 dependency packages leaves Git clean for the license paths.
+- Formatting, Clippy with `-D warnings`, both release binaries and portable packaging pass locally.
+- New Windows regressions cover a recognized old log held without `FILE_SHARE_DELETE`, successful writes and one-time reporting despite cleanup failure, and protection of the active log among future-timestamped filenames.
+- Independent probes linked against the real corrected backend confirm `WORKER_STARTUP=Ok` with the locked old log and `SESSION_LOG_COUNT_AFTER_STARTUP=5` for the clock-rollback fixtures. Before the correction, the same scenarios produced startup error 32 and six session logs respectively.
+- Tooltip policy tests cover failed application without false acknowledgement, a one-second deferred retry, success, suppression of unchanged successful state and one diagnostic per failure streak.
+- AppData, Cargo outputs and temporary files are isolated test paths. These checks do not delete personal logs, alter the system clock, connect Bluetooth or deliberately fail Explorer APIs.
+
+These are local results, not a claim of remote success on an unbuilt commit. The exact corrected PR head must pass its own GitHub Windows CI before merging into `develop`; the merged commit must be checked separately. No hardware playback or long-running tray stability claim is added.
