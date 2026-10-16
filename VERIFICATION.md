@@ -36,7 +36,7 @@ The tray routing tests cover stable opaque device IDs, busy-action exclusion, Qu
 - Audible playback through the new tray command path, Android call return, repeated link loss, sleep/resume, long-running stability and iPhone behavior require their own hardware tests. Earlier console playback was user-validated; it is not substituted for these tests.
 - The worker's diagnostic save path was executed by tests. Automatic Notepad opening from the native menu was not successfully exercised by the desktop automation and must be checked manually; no successful UI-open result is claimed.
 - Explorer/taskbar recreation support is implemented but was not tested by restarting the user's Explorer session.
-- Sources were published with the owner's approval to `https://github.com/mustben/AudioBridge`, branch `develop`. The first Windows CI run (38796430697) passed formatting, Rust tests and Clippy, then failed license consistency because Git's Windows checkout changed line endings. That failure was reproduced in a fresh clone. The correction preserves copied license bytes with `.gitattributes` and writes generated notices with explicit LF; the consistency guard remains enabled. Remote success must be verified on the corrected commit, not inferred from local tests. No tag or release has been created.
+- Sources were published with the owner's approval to `https://github.com/mustben/AudioBridge`, branch `develop`. The first Windows CI run (38796430697) passed formatting, Rust tests and Clippy, then failed license consistency because Git's Windows checkout changed line endings. That failure was reproduced in a fresh clone. The correction preserves copied license bytes with `.gitattributes` and writes generated notices with explicit LF; the consistency guard remains enabled. The corrected commit `0debb36439bb7acd4cf669978ff9726758773fba` passed [Windows CI run 38798694441](https://github.com/mustben/AudioBridge/actions/runs/38798694441), rechecked through GitHub on 2026-10-16. This result applies only to that commit. No tag or release has been created.
 
 ## Final independent review
 
@@ -47,3 +47,16 @@ The final targeted independent review accepted all four previously blocking corr
 The source publication set is enumerated with Git's ignore rules and scanned for known private paths/device identifiers and common token formats. No matches were found in the scanned text. This is a bounded check, not a formal security audit. Full desktop screenshots, local diagnostics, logs, executables and build outputs are not included in the source publication set.
 
 The application is an unsigned preview. No auto-start registration, service, certificate trust change, telemetry or updater is implemented. The initial source publication was owner-approved; tags and releases still require separate approval.
+
+## 2026-10-16 review corrections (AB-01–AB-05)
+
+All five findings were confirmed statically against the unchanged baseline `0debb364`; none were claimed reproduced on Bluetooth hardware. See [CORRECTIONS.md](CORRECTIONS.md) for the implementation and test map.
+
+Local Linux validation of this change:
+
+- Rust 1.93.1: `cargo fmt --all -- --check`.
+- `cargo check --locked --all-targets --target x86_64-pc-windows-msvc` and Clippy with `-D warnings`: type checking for Windows, not execution of Windows binaries.
+- Native standalone Rust test execution of `src/protocol.rs` and `src/logging.rs`: snapshot backlog/control-event preservation and log rotation/retention/foreign-file preservation.
+- `python scripts/test_export_licenses.py`: four passing regressions. No dependency or lockfile changes.
+
+The complete Windows suite, release build and packaging must be verified by the branch PR CI. Hardware playback, repeated state-read failures from a real adapter, disconnect during a real Windows open, sleep/resume, long modal menus and Explorer recreation have not been executed in this Linux session. No measured CPU/RAM benefit is claimed.
