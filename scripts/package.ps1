@@ -24,6 +24,7 @@ $files = [ordered]@{
     (Join-Path $root 'DIAGNOSTICS.md') = 'AudioBridge/DIAGNOSTICS.md'
     (Join-Path $root 'PRIVACY.md') = 'AudioBridge/PRIVACY.md'
     (Join-Path $root 'VERIFICATION.md') = 'AudioBridge/VERIFICATION.md'
+    (Join-Path $root 'CORRECTIONS.md') = 'AudioBridge/CORRECTIONS.md'
     (Join-Path $root 'CONTRIBUTING.md') = 'AudioBridge/CONTRIBUTING.md'
     (Join-Path $root 'PUBLISHING.md') = 'AudioBridge/PUBLISHING.md'
     (Join-Path $root 'SECURITY.md') = 'AudioBridge/SECURITY.md'
